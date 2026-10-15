@@ -1,0 +1,18 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Built add-on zips go to build/; releases carry them
+build/
+*.zip
+
+# Blender backups
+*.blend1
+*.blend2
+
+# Editors and OS files
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
