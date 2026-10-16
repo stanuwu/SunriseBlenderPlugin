@@ -5,7 +5,7 @@ import math
 import bpy
 from mathutils import Matrix, Vector
 
-from . import bundle
+from . import bundle, progress
 
 
 LIGHTS = 'world.lights.json'
@@ -88,7 +88,8 @@ def _window(data):
     links.new(window.outputs['Window'], nodes['Emission'].inputs['Strength'])
 
 
-def _light(name, kind, info, energy, target, origin, location, direction=None):
+def _light(name, kind, info, energy, target, origin, location, objects, direction=None):
+    """Creates the light data now and requests its object; returns the request."""
     data = bpy.data.lights.new(name, kind)
     data.color = _numbers(info['Color'], 3, 'Color')
     data.energy = energy
@@ -100,33 +101,38 @@ def _light(name, kind, info, energy, target, origin, location, direction=None):
     data.use_custom_distance = True
     data.cutoff_distance = max(_scalar(info, 'Range'), 0.01)
     _window(data)
-    obj = bpy.data.objects.new(name, data)
-    target.objects.link(obj)
-    obj.parent = origin
-    obj.location = location
-    _aim(obj, direction if direction is not None else _numbers(info['Direction'], 3, 'Direction'))
-    obj['sunrise_light_id'] = info['Id']
-    obj['sunrise_light_table'] = f'{info["TableTag"]:08X}'
-    obj['sunrise_light_row'] = info['Row']
-    obj['sunrise_material_tag'] = f'{info["MaterialTag"]:08X}'
-    obj['sunrise_pixel_shader'] = f'{info["PixelShaderTag"]:08X}'
-    obj['sunrise_bubble'] = f'{info["BubbleHash"]:08X}'
-    obj['sunrise_light_fit'] = str(info.get('Fit', ''))
-    obj['sunrise_light_copies'] = int(info.get('Copies', 1))
-    obj['sunrise_light_animated'] = bool(info.get('Animated'))
-    return obj
+    aim = direction if direction is not None else _numbers(info['Direction'], 3, 'Direction')
+    request = objects.add(name, data)
+
+    def setup(obj):
+        target.link(obj, hidden=request.hidden)
+        obj.parent = bundle._resolve(origin)
+        obj.location = location
+        _aim(obj, aim)
+        obj['sunrise_light_id'] = info['Id']
+        obj['sunrise_light_table'] = f'{info["TableTag"]:08X}'
+        obj['sunrise_light_row'] = info['Row']
+        obj['sunrise_material_tag'] = f'{info["MaterialTag"]:08X}'
+        obj['sunrise_pixel_shader'] = f'{info["PixelShaderTag"]:08X}'
+        obj['sunrise_bubble'] = f'{info["BubbleHash"]:08X}'
+        obj['sunrise_light_fit'] = str(info.get('Fit', ''))
+        obj['sunrise_light_copies'] = int(info.get('Copies', 1))
+        obj['sunrise_light_animated'] = bool(info.get('Animated'))
+
+    request.setup = setup
+    return request
 
 
-def _place(info, target, origin):
+def _place(info, target, origin, objects):
     """One game light as Blender lights; a line becomes evenly spaced points."""
     kind = info.get('Kind')
     name = f'Light {info["Id"]} ({kind})'
     position = Vector(_numbers(info['Position'], 3, 'Position'))
     intensity = _scalar(info, 'Intensity')
     if kind == 'Point':
-        return [_light(name, 'POINT', info, intensity * WATTS_PER_INTENSITY, target, origin, position)]
+        return [_light(name, 'POINT', info, intensity * WATTS_PER_INTENSITY, target, origin, position, objects)]
     if kind == 'Spot':
-        return _cone(name, info, intensity, target, origin, position, None)
+        return _cone(name, info, intensity, target, origin, position, None, objects)
     if kind == 'Line':
         length = _scalar(info, 'Length')
         axis = Vector(_numbers(info['Direction'], 3, 'Direction')).normalized()
@@ -147,59 +153,64 @@ def _place(info, target, origin):
             offset = ((index + 0.5) / count - 0.5) * length
             at = position + axis * offset
             if aim is None:
-                objects = [_light(f'{name} {index + 1}', 'POINT', info, intensity * share * WATTS_PER_INTENSITY, target, origin, at)]
+                requests = [_light(f'{name} {index + 1}', 'POINT', info, intensity * share * WATTS_PER_INTENSITY, target, origin, at,
+                                   objects)]
             else:
-                objects = _cone(f'{name} {index + 1}', info, intensity * share, target, origin, at, aim, share)
-            for obj in objects:
-                obj['sunrise_line_length'] = length
-            result += objects
+                requests = _cone(f'{name} {index + 1}', info, intensity * share, target, origin, at, aim, objects, share)
+            for request in requests:
+                request.props['sunrise_line_length'] = length
+            result += requests
         return result
     raise ValueError('World light kind is unsupported: ' + str(kind))
 
 
-def _cone(name, info, intensity, target, origin, location, direction, share=1.0):
+def _cone(name, info, intensity, target, origin, location, direction, objects, share=1.0):
     """
     A spot, a point for the light the game sends outside the cone, since Blender spots end at 90 degrees,
     and a negative spot facing back that takes light away behind the light.
     """
     if direction is None:
         direction = _numbers(info['Direction'], 3, 'Direction')
-    obj = _light(name, 'SPOT', info, intensity * WATTS_PER_INTENSITY, target, origin, location, direction)
-    obj.data.spot_size = math.radians(min(max(_scalar(info, 'SpotAngle'), 1.0), 180.0))
-    obj.data.spot_blend = min(_scalar(info, 'SpotBlend'), 1.0)
-    result = [obj]
+    spot = _light(name, 'SPOT', info, intensity * WATTS_PER_INTENSITY, target, origin, location, objects, direction)
+    spot.data.spot_size = math.radians(min(max(_scalar(info, 'SpotAngle'), 1.0), 180.0))
+    spot.data.spot_blend = min(_scalar(info, 'SpotBlend'), 1.0)
+    result = [spot]
     omni = _scalar(info, 'Omni') if 'Omni' in info else 0.0
     if omni > 0:
-        result.append(_light(name + ' omni', 'POINT', info, omni * share * WATTS_PER_INTENSITY, target, origin, location))
+        result.append(_light(name + ' omni', 'POINT', info, omni * share * WATTS_PER_INTENSITY, target, origin, location, objects))
     back = _scalar(info, 'Back') if 'Back' in info else 0.0
     if back > 0:
         # The export keeps the back spot at or below the omni light, so no surface goes below black.
-        dark = _light(name + ' back', 'SPOT', info, -back * share * WATTS_PER_INTENSITY, target, origin, location,
+        dark = _light(name + ' back', 'SPOT', info, -back * share * WATTS_PER_INTENSITY, target, origin, location, objects,
                       [-v for v in direction])
         dark.data.spot_size = math.radians(min(max(_scalar(info, 'BackAngle'), 1.0), 180.0))
         dark.data.spot_blend = min(_scalar(info, 'BackBlend'), 1.0)
-        dark['sunrise_negative'] = True
+        dark.props['sunrise_negative'] = True
         result.append(dark)
     return result
 
 
-def _sun(info, target, origin, name):
+def _sun(info, target, origin, name, objects):
     data = bpy.data.lights.new(name + ' sun', 'SUN')
     data.color = _numbers(info['Color'], 3, 'Color')
     data.energy = _scalar(info, 'Irradiance')
     data.use_shadow = True
-    obj = bpy.data.objects.new(name + ' sun', data)
-    target.objects.link(obj)
-    obj.parent = origin
     # Direction points at the sun; the light shines the other way.
-    _aim(obj, [-v for v in _numbers(info['Direction'], 3, 'Direction')])
-    obj['sunrise_time_of_day'] = _scalar(info, 'TimeOfDay')
-    obj['sunrise_curve_set'] = f'{info["CurveSetTag"]:08X}'
-    if info.get('ShadowDirection') is not None:
-        # The game casts sun shadows along this direction; one Blender sun shades and shadows along Direction.
-        obj['sunrise_shadow_direction'] = _numbers(info['ShadowDirection'], 3, 'ShadowDirection')
-    return obj
+    aim = [-v for v in _numbers(info['Direction'], 3, 'Direction')]
+    time_of_day, curve_set = _scalar(info, 'TimeOfDay'), f'{info["CurveSetTag"]:08X}'
+    # The game casts sun shadows along this direction; one Blender sun shades and shadows along Direction.
+    shadow = _numbers(info['ShadowDirection'], 3, 'ShadowDirection') if info.get('ShadowDirection') is not None else None
 
+    def setup(obj):
+        target.link(obj)
+        obj.parent = bundle._resolve(origin)
+        _aim(obj, aim)
+        obj['sunrise_time_of_day'] = time_of_day
+        obj['sunrise_curve_set'] = curve_set
+        if shadow is not None:
+            obj['sunrise_shadow_direction'] = shadow
+
+    return objects.add(name + ' sun', data, setup)
 
 def _image(root, relative):
     image = bpy.data.images.load(str(bundle._path(root, relative)), check_existing=False)
@@ -237,7 +248,7 @@ def _world(info, root, name):
     return world
 
 
-def _volumes(volumes, target, origin, name):
+def _volumes(volumes, target, origin, name, objects):
     """
     One EEVEE volume light probe per game cubemap box. Baked, they shade the sky light by what blocks it,
     as the game's indoor cubemaps do; Cycles traces it instead and ignores them.
@@ -250,18 +261,21 @@ def _volumes(volumes, target, origin, name):
         data = bpy.data.lightprobes.new(f'{name} light volume {index}', 'VOLUME')
         data.resolution_x, data.resolution_y, data.resolution_z = (
             min(max(round(2 * e / VOLUME_SPACING), VOLUME_MIN), VOLUME_MAX) for e in extents)
-        obj = bpy.data.objects.new(data.name, data)
-        target.objects.link(obj)
-        obj.parent = origin
-        obj.matrix_basis = bundle._matrix(_numbers(info['Transform'], 16, 'Transform')) @ Matrix.Diagonal((*extents, 1))
-        obj['sunrise_bubble'] = f'{info["BubbleHash"]:08X}'
-        obj['sunrise_placement_source'] = f'{info["PlacementSourceTag"]:08X}'
-        result.append(obj)
+        matrix = bundle._matrix(_numbers(info['Transform'], 16, 'Transform')) @ Matrix.Diagonal((*extents, 1))
+        props = {'sunrise_bubble': f'{info["BubbleHash"]:08X}', 'sunrise_placement_source': f'{info["PlacementSourceTag"]:08X}'}
+
+        def setup(obj, matrix=matrix):
+            target.link(obj)
+            obj.parent = bundle._resolve(origin)
+            obj.matrix_basis = matrix
+
+        request = objects.add(data.name, data, setup)
+        request.props.update(props)
+        result.append(request)
     return result
 
-
 def _bake(scene, volumes):
-    """Bakes the volumes; in the interface it runs as a job, in background mode before returning."""
+    """Bakes the volumes before returning, in the interface too."""
     if not volumes:
         return 'no light volumes'
     if int(scene.eevee.gi_irradiance_pool_size) < IRRADIANCE_POOL_MB:
@@ -285,10 +299,10 @@ def _view(scene):
     scene['sunrise_exposure'] = EXPOSURE
 
 
-def import_lights(manifest_path, collection, origin):
+def light_steps(manifest_path, collection, origin, objects):
     """
-    Adds the lights beside a world manifest to a child collection of the world.
-    Returns None when the export has no lights file or no lights.
+    Requests the lights, the sun and the light volumes beside a world manifest, in a child collection of the world.
+    Returns the state finish and sky need, or None when the export has no lights file or no lights.
     """
     path = manifest_path.parent / LIGHTS
     if not path.exists():
@@ -299,52 +313,77 @@ def import_lights(manifest_path, collection, origin):
     lights = data.get('Lights')
     if not isinstance(lights, list) or len(lights) > MAX_LIGHTS:
         raise ValueError('World light table is invalid.')
-    sky = data.get('Sky')
-    if not lights and not isinstance(data.get('Sun'), dict) and not isinstance(sky, dict):
+    if not lights and not isinstance(data.get('Sun'), dict) and not isinstance(data.get('Sky'), dict):
         return None
+    volumes = data.get('Volumes', [])
+    if not isinstance(volumes, list) or len(volumes) > MAX_LIGHTS:
+        raise ValueError('World light volume table is invalid.')
+    holder = bpy.data.collections.new(collection.name + ' lights')
+    collection.children.link(holder)
+    holder['sunrise_world_lights'] = str(path)
+    target = bundle._Layout(holder)
+    placed = []
+    for index, info in enumerate(lights):
+        requests = _place(info, target, origin, objects)
+        for request in requests:
+            request.hidden = not info.get('Enabled', True)
+        placed += requests
+        yield 'Lights', index + 1, len(lights)
+    visible = [(request.data.energy * request.data.cutoff_distance, request) for request in placed if not request.hidden]
+    # Negative lights sort last, so the cap hides every one of them before any positive light.
+    visible.sort(key=lambda pair: pair[0], reverse=True)
+    for _, request in visible[MAX_VISIBLE:]:
+        request.hidden = True
+        request.props['sunrise_hidden_over_cap'] = True
+    if isinstance(data.get('Sun'), dict):
+        _sun(data['Sun'], target, origin, collection.name, objects)
+    probes = _volumes(volumes, target, origin, collection.name, objects)
+    return {'path': path, 'data': data, 'target': target, 'probes': probes, 'blender_lights': len(placed),
+            'hidden_over_cap': max(len(visible) - MAX_VISIBLE, 0)}
+
+
+def finish_lights(state):
+    """Writes the hiding of the light objects once they are set up; returns the volume objects for _bake."""
+    target = state['target']
+    target.collection['sunrise_light_counts'] = str({'lights': len(state['data']['Lights']), 'blender_lights': state['blender_lights'],
+                                                     'hidden_over_cap': state['hidden_over_cap'], 'light_volumes': len(state['probes'])})
+    target.write(refresh=True)
+    return [request.obj for request in state['probes']]
+
+
+def set_sky(state, name):
+    """Sets the scene's world to the game's sky and the view to the game's film curve; older exports carry no sky."""
+    sky = state['data'].get('Sky')
+    if isinstance(sky, dict):
+        scene = bpy.context.scene
+        scene.world = _world(sky, state['path'].parent, name)
+        _view(scene)
+        state['target'].collection['sunrise_world_sky'] = scene.world.name
+
+
+def import_lights(manifest_path, collection, origin):
+    """
+    Adds the lights beside a world manifest to a child collection of the world and bakes its light volumes.
+    Returns None when the export has no lights file or no lights.
+    """
     kinds = ('objects', 'collections', 'lights', 'worlds', 'images', 'lightprobes', 'node_groups')
-    before = {kind: set(getattr(bpy.data, kind)) for kind in kinds}
+    before = progress.snapshot(kinds)
     scene = bpy.context.scene
     view = (scene.world, scene.view_settings.view_transform, scene.view_settings.look, scene.view_settings.exposure)
     try:
-        target = bpy.data.collections.new(collection.name + ' lights')
-        collection.children.link(target)
-        target['sunrise_world_lights'] = str(path)
-        placed = []
-        for info in lights:
-            objects = _place(info, target, origin)
-            for obj in objects:
-                obj.hide_viewport = obj.hide_render = not info.get('Enabled', True)
-            placed.append((info, objects))
-        visible = [(obj.data.energy * obj.data.cutoff_distance, obj) for _, objects in placed for obj in objects
-                   if not obj.hide_render]
-        # Negative lights sort last, so the cap hides every one of them before any positive light.
-        visible.sort(key=lambda pair: pair[0], reverse=True)
-        for _, obj in visible[MAX_VISIBLE:]:
-            obj.hide_viewport = obj.hide_render = True
-            obj['sunrise_hidden_over_cap'] = True
-        if isinstance(data.get('Sun'), dict):
-            _sun(data['Sun'], target, origin, collection.name)
-        if isinstance(sky, dict):
-            # Older exports carry no sky; the scene's world and view then stay as they are.
-            scene.world = _world(sky, path.parent, collection.name)
-            _view(scene)
-            target['sunrise_world_sky'] = scene.world.name
-        volumes = data.get('Volumes', [])
-        if not isinstance(volumes, list) or len(volumes) > MAX_LIGHTS:
-            raise ValueError('World light volume table is invalid.')
-        probes = _volumes(volumes, target, origin, collection.name)
-        target['sunrise_light_counts'] = str({'lights': len(lights), 'blender_lights': sum(len(o) for _, o in placed),
-                                              'hidden_over_cap': max(len(visible) - MAX_VISIBLE, 0),
-                                              'light_volumes': len(probes)})
+        objects = bundle._Objects()
+        state = progress.run(light_steps(manifest_path, collection, origin, objects))
+        if state is None:
+            return None
+        progress.run(objects.create('Lights'))
+        progress.run(objects.set_up(lambda index: 'Lights'))
+        probes = finish_lights(state)
+        set_sky(state, collection.name)
         bpy.context.view_layer.update()
-        target['sunrise_light_volume_bake'] = _bake(scene, probes)
-        return target
+        state['target'].collection['sunrise_light_volume_bake'] = _bake(scene, probes)
+        return state['target'].collection
     except BaseException:
         scene.world = view[0]
         scene.view_settings.view_transform, scene.view_settings.look, scene.view_settings.exposure = view[1:]
-        for kind in kinds:
-            table = getattr(bpy.data, kind)
-            for value in set(table) - before[kind]:
-                table.remove(value, do_unlink=True)
+        progress.rollback(before)
         raise

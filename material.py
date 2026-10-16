@@ -11,8 +11,18 @@ import bpy
 from bpy.props import StringProperty
 from bpy_extras.io_utils import ImportHelper
 
+if __package__:
+    from . import progress
+else:
+    # Run as a single file, the module loads the progress module beside it.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("sunrise_progress", Path(__file__).with_name("progress.py"))
+    progress = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(progress)
+
 
 MANIFEST = "material.sunrise-material.json"
+PHASES = ("Reading the material", "Textures", "Constants")
 EDITS = "material.edited.sunrise-material.json"
 
 
@@ -38,11 +48,26 @@ def _write_edits(output, document):
 
 def import_material(manifest_path, target=None):
     """Adds the material to target, or to the active object, and selects its slot."""
+    return progress.run(import_steps(manifest_path, target if target is not None else getattr(bpy.context, "object", None)))
+
+
+def import_steps(manifest_path, target):
+    """The material import as steps that yield (phase, done, total); closing them early removes what they added."""
     manifest = Path(manifest_path).resolve()
     root = manifest.parent
+    yield PHASES[0], 0, 0
     document = json.loads(manifest.read_text(encoding="utf-8-sig"))
     if document.get("Format") != "sunrise-material" or document.get("Version") != 1:
         raise ValueError("Unsupported Sunrise material bundle.")
+    before = progress.snapshot(("materials", "images"))
+    try:
+        return (yield from _build(document, root, target))
+    except BaseException:
+        progress.rollback(before)
+        raise
+
+
+def _build(document, root, selected):
     material = bpy.data.materials.new(document["Name"])
     material["sunrise_document"] = json.dumps(document)
     material["sunrise_root"] = str(root)
@@ -50,6 +75,7 @@ def import_material(manifest_path, target=None):
     nodes = material.node_tree.nodes
     files = {item["TagHash"]: item for item in document["Textures"]}
     for index, slot in enumerate(document["Slots"]):
+        yield PHASES[1], index, len(document["Slots"])
         node = nodes.new("ShaderNodeTexImage")
         node.name = f'{slot["Stage"]}_slot_{slot["Slot"]}'
         node.label = f'{slot["Stage"]} slot {slot["Slot"]} / {slot["TextureTag"]:08X}'
@@ -65,6 +91,8 @@ def import_material(manifest_path, target=None):
                 except RuntimeError as error:
                     node["sunrise_image_error"] = str(error)
     for index, scalar in enumerate(document["Constants"]):
+        if index % 64 == 0:
+            yield PHASES[2], index, len(document["Constants"])
         value = float(scalar["Value"])
         if not math.isfinite(value):
             continue
@@ -74,7 +102,6 @@ def import_material(manifest_path, target=None):
         node.location = (-300 + (index % 4) * 180, -350 - (index // 4) * 130)
         node.outputs[0].default_value = value
         node["sunrise_constant_offset"] = scalar["Offset"]
-    selected = target if target is not None else getattr(bpy.context, "object", None)
     if selected is not None and hasattr(selected.data, "materials"):
         selected.data.materials.append(material)
         selected.active_material_index = len(selected.data.materials) - 1
@@ -124,20 +151,16 @@ def export_material_edits(material=None):
     return str(output)
 
 
-class SUNRISE_OT_import_material(bpy.types.Operator, ImportHelper):
+class SUNRISE_OT_import_material(progress.ImportSteps, bpy.types.Operator, ImportHelper):
     bl_idname = "sunrise.import_material"
     bl_label = "Import Sunrise material"
     bl_description = "Add material.sunrise-material.json to the active mesh"
     filename_ext = ".json"
     filter_glob: StringProperty(default="*.json", options={'HIDDEN'}, maxlen=255)
+    phases = PHASES
 
-    def execute(self, context):
-        try:
-            import_material(self.filepath, context.object)
-        except (ValueError, OSError, RuntimeError, KeyError) as error:
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
-        return {'FINISHED'}
+    def steps(self, context):
+        return import_steps(self.filepath, context.object)
 
 
 class SUNRISE_OT_export_material(bpy.types.Operator):

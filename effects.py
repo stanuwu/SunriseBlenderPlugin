@@ -3,7 +3,7 @@
 import bpy
 import numpy as np
 
-from . import bundle
+from . import bundle, progress
 
 
 FORMAT = 'sunrise-effects'
@@ -20,6 +20,8 @@ SOURCE_FACTORS = {'Zero', 'One', 'SourceAlpha', 'InverseSourceAlpha', 'SourceCol
                   'DestinationAlpha', 'InverseDestinationAlpha', 'DestinationColor'}
 DESTINATION_FACTORS = {'Zero', 'One', 'SourceAlpha', 'InverseSourceAlpha', 'SourceColor', 'InverseSourceColor',
                        'DestinationAlpha', 'InverseDestinationAlpha'}
+# Ray visibility a sprite turns off.
+RAY_FLAGS = ('visible_shadow', 'visible_diffuse', 'visible_glossy', 'visible_transmission', 'visible_volume_scatter')
 
 
 def _count(value, maximum):
@@ -35,10 +37,20 @@ def _rows(document, name, maximum=MAX_EMITTERS):
     return rows
 
 
+KINDS = ('objects', 'collections', 'meshes', 'materials', 'images', 'node_groups')
+
+
+def world_steps(manifest_path, collection, origin, objects):
+    """Requests a world scene's baked effects in a child collection; returns the state for finish, or None."""
+    path = manifest_path.parent / WORLD_EFFECTS
+    if not path.exists():
+        return None
+    return (yield from _steps(path, manifest_path.parent, collection, lambda info: origin, objects))
+
+
 def import_world_effects(manifest_path, collection, origin):
     """Adds a world scene's baked effects to a child collection; None when it has none."""
-    path = manifest_path.parent / WORLD_EFFECTS
-    return _import(path, manifest_path.parent, collection, lambda info: origin) if path.exists() else None
+    return _import(lambda objects: world_steps(manifest_path, collection, origin, objects))
 
 
 def import_bundle_effects(root, collection):
@@ -47,10 +59,26 @@ def import_bundle_effects(root, collection):
     if not path.exists():
         return None
     markers = {obj.get('sunrise_emitter_tag'): obj for obj in collection.all_objects if obj.get('sunrise_emitter_tag')}
-    return _import(path, root, collection, lambda info: markers.get(f'{info["EmitterTag"]:08X}'))
+    return _import(lambda objects: _steps(path, root, collection, lambda info: markers.get(f'{info["EmitterTag"]:08X}'), objects))
 
 
-def _import(path, root, collection, parent_of):
+def _import(plan):
+    """Plans, creates and finishes the effects; a failure removes what they added."""
+    before = progress.snapshot(KINDS)
+    try:
+        objects = bundle._Objects()
+        state = progress.run(plan(objects))
+        if state is None:
+            return None
+        progress.run(objects.create('Effects'))
+        progress.run(objects.set_up(lambda index: 'Effects'))
+        return finish(state)
+    except BaseException:
+        progress.rollback(before)
+        raise
+
+
+def _steps(path, root, collection, parent_of, objects):
     data = bundle._read(path)
     if data.get('Format') != FORMAT or data.get('Version') != 1 or data.get('Coordinates') != 'NativeZUp':
         raise ValueError('Unsupported Sunrise effects.')
@@ -63,40 +91,45 @@ def _import(path, root, collection, parent_of):
     if not emitters:
         return None
     samples = _samples(root, data)
-    before = {kind: set(getattr(bpy.data, kind)) for kind in ('objects', 'collections', 'meshes', 'materials', 'images',
-                                                              'node_groups')}
-    try:
-        images = [_image(root, info, index) for index, info in enumerate(_rows(data, 'Sprites'))]
-        materials = _rows(data, 'Materials')
-        if any(info.get('Id') != index for index, info in enumerate(materials)):
-            raise ValueError('Effect material IDs are not consecutive.')
-        built = {}
-        group = _node_group()
-        target = bpy.data.collections.new(collection.name + ' effects')
-        collection.children.link(target)
-        target['sunrise_effects'] = str(path)
-        for info in emitters:
-            first, count = _count(info.get('First'), len(samples)), _count(info.get('Count'), len(samples))
-            frames = _count(info.get('Frames'), 65535)
-            if first + count > len(samples) or frames == 0:
-                raise ValueError('Effect emitter leaves its samples.')
-            rows = samples[first:first + count]
-            if len(rows) and int(rows['frame'].max()) >= frames:
-                raise ValueError('Effect sample frame leaves its loop.')
-            material = _count(info.get('Material'), len(materials) - 1)
-            if material not in built:
-                built[material] = _material(materials[material], images)
-            _emitter(info, rows, frames, rate, built[material], group, target, parent_of(info))
-        target['sunrise_effect_counts'] = str({'emitters': len(emitters), 'samples': len(samples),
-                                               'skipped': len(_rows(data, 'Skipped'))})
-        return target
-    except BaseException:
-        for kind, previous in before.items():
-            table = getattr(bpy.data, kind)
-            for value in set(table) - previous:
-                table.remove(value, do_unlink=True)
-        raise
+    images = [_image(root, info, index) for index, info in enumerate(_rows(data, 'Sprites'))]
+    materials = _rows(data, 'Materials')
+    if any(info.get('Id') != index for index, info in enumerate(materials)):
+        raise ValueError('Effect material IDs are not consecutive.')
+    built = {}
+    group = _node_group()
+    holder = bpy.data.collections.new(collection.name + ' effects')
+    collection.children.link(holder)
+    holder['sunrise_effects'] = str(path)
+    target = bundle._Layout(holder)
+    meshes = bundle._Names(bpy.data.meshes)
+    for index, info in enumerate(emitters):
+        first, count = _count(info.get('First'), len(samples)), _count(info.get('Count'), len(samples))
+        frames = _count(info.get('Frames'), 65535)
+        if first + count > len(samples) or frames == 0:
+            raise ValueError('Effect emitter leaves its samples.')
+        rows = samples[first:first + count]
+        if len(rows) and int(rows['frame'].max()) >= frames:
+            raise ValueError('Effect sample frame leaves its loop.')
+        material = _count(info.get('Material'), len(materials) - 1)
+        if material not in built:
+            built[material] = _material(materials[material], images)
+        _emitter(info, rows, frames, rate, built[material], group, target, parent_of(info), meshes, objects)
+        yield 'Effects', index + 1, len(emitters)
+    return {'holder': holder, 'target': target, 'emitters': len(emitters), 'samples': len(samples),
+            'skipped': len(_rows(data, 'Skipped'))}
 
+
+def finish(state):
+    """Turns off the sprites' ray visibility and writes their hiding, once their objects are set up."""
+    holder = state['holder']
+    # A sprite is seen, never lights or shadows anything, as in Studio.
+    off = np.zeros(len(holder.objects), dtype=bool)
+    for flag in RAY_FLAGS:
+        if flag in bpy.types.Object.bl_rna.properties:
+            holder.objects.foreach_set(flag, off)
+    state['target'].write(refresh=True)
+    holder['sunrise_effect_counts'] = str({'emitters': state['emitters'], 'samples': state['samples'], 'skipped': state['skipped']})
+    return holder
 
 def _samples(root, data):
     path = bundle._path(root, data['DataPath'])
@@ -126,10 +159,10 @@ def _image(root, info, index):
     return image
 
 
-def _emitter(info, rows, frames, rate, material, group, target, parent):
+def _emitter(info, rows, frames, rate, material, group, target, parent, meshes, objects):
     """One point per sample; the node group draws the points of the current loop frame."""
     name = str(info.get('Name') or 'Effect')
-    mesh = bpy.data.meshes.new(name)
+    mesh = bpy.data.meshes.new(meshes(name))
     mesh.vertices.add(len(rows))
     mesh.vertices.foreach_set('co', np.ascontiguousarray(rows['position'], dtype=np.float32).reshape(-1))
     for key, kind, values in (('sunrise_frame', 'INT', rows['frame'].astype(np.int32)),
@@ -139,34 +172,32 @@ def _emitter(info, rows, frames, rate, material, group, target, parent):
         attribute = mesh.attributes.new(key, kind, 'POINT')
         attribute.data.foreach_set('value', values)
     mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
-    target.objects.link(obj)
-    if parent is not None:
-        # Samples are in scene space; the parent inverse keeps them there.
-        obj.parent = parent
-        obj.matrix_parent_inverse = parent.matrix_world.inverted()
-    modifier = obj.modifiers.new('Effect sprites', 'NODES')
-    modifier.node_group = group
-    for key, value in (('Frames', frames), ('Rate', float(rate)), ('Material', material)):
-        getattr(modifier.properties.inputs, group.interface.items_tree[key].identifier).value = value
-    # A sprite is seen, never lights or shadows anything, as in Studio.
-    for flag in ('visible_shadow', 'visible_diffuse', 'visible_glossy', 'visible_transmission', 'visible_volume_scatter'):
-        if hasattr(obj, flag):
-            setattr(obj, flag, False)
-    obj.hide_render = obj.hide_viewport = not info.get('Default', True)
-    obj['sunrise_effect_preview'] = True
-    obj['sunrise_effect_index'] = info['Id']
-    obj['sunrise_preview_only'] = True
-    obj['sunrise_effect_tag'] = f'{info["EffectTag"]:08X}'
-    obj['sunrise_effect_system'] = f'{info["SystemTag"]:08X}'
-    obj['sunrise_effect_emitter'] = f'{info["EmitterTag"]:08X}'
-    obj['sunrise_placement_source'] = f'{info["SourceTag"]:08X}'
-    obj['sunrise_placement_offset'] = info['SourceOffset']
-    obj['sunrise_effect_trigger'] = str(info.get('Trigger', ''))
-    obj['sunrise_effect_loop'] = f'{info.get("Mode", "")}, {frames / rate:.2f} s'
-    if info.get('Gpu'):
-        obj['sunrise_effect_note'] = 'The game simulates this emitter on the GPU; Studio runs its CPU steps.'
-    return obj
+
+    def setup(obj):
+        target.link(obj, hidden=not info.get('Default', True))
+        owner = bundle._resolve(parent)
+        if owner is not None:
+            # Samples are in scene space; the parent inverse keeps them there.
+            obj.parent = owner
+            obj.matrix_parent_inverse = owner.matrix_world.inverted()
+        modifier = obj.modifiers.new('Effect sprites', 'NODES')
+        modifier.node_group = group
+        for key, value in (('Frames', frames), ('Rate', float(rate)), ('Material', material)):
+            getattr(modifier.properties.inputs, group.interface.items_tree[key].identifier).value = value
+        obj['sunrise_effect_preview'] = True
+        obj['sunrise_effect_index'] = info['Id']
+        obj['sunrise_preview_only'] = True
+        obj['sunrise_effect_tag'] = f'{info["EffectTag"]:08X}'
+        obj['sunrise_effect_system'] = f'{info["SystemTag"]:08X}'
+        obj['sunrise_effect_emitter'] = f'{info["EmitterTag"]:08X}'
+        obj['sunrise_placement_source'] = f'{info["SourceTag"]:08X}'
+        obj['sunrise_placement_offset'] = info['SourceOffset']
+        obj['sunrise_effect_trigger'] = str(info.get('Trigger', ''))
+        obj['sunrise_effect_loop'] = f'{info.get("Mode", "")}, {frames / rate:.2f} s'
+        if info.get('Gpu'):
+            obj['sunrise_effect_note'] = 'The game simulates this emitter on the GPU; Studio runs its CPU steps.'
+
+    return objects.add(name, mesh, setup)
 
 
 def _node_group():

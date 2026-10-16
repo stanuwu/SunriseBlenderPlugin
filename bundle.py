@@ -19,6 +19,15 @@ from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Vector
 
+if __package__:
+    from . import progress
+else:
+    # Run as a single file, the module loads the progress module beside it.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location('sunrise_progress', Path(__file__).with_name('progress.py'))
+    progress = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(progress)
+
 
 MANIFEST = "asset.sunrise-bundle.json"
 EDITS = "asset.edited.sunrise-bundle.json"
@@ -94,6 +103,146 @@ def _close(a, b, tolerance=0.00001):
 
 def _same_vectors(a, b):
     return len(a) == len(b) and all(_close(x, y) for x, y in zip(a, b))
+
+
+# Longest data block name, in UTF-8 bytes.
+NAME_BYTES = 255
+
+
+def _clip(name, size=NAME_BYTES):
+    return name.encode('utf-8')[:size].decode('utf-8', 'ignore')
+
+
+class _Names:
+    """Unused names for one kind of data block; Blender's own search slows as a name repeats."""
+    def __init__(self, table):
+        self.used = {value.name for value in table}
+        self.counts = {}
+
+    def __call__(self, name):
+        name = _clip(name)
+        if name not in self.used:
+            self.used.add(name)
+            return name
+        number = self.counts.get(name, 0)
+        while True:
+            number += 1
+            suffix = f'.{number:03d}'
+            candidate = _clip(name, NAME_BYTES - len(suffix)) + suffix
+            if candidate not in self.used:
+                self.counts[name] = number
+                self.used.add(candidate)
+                return candidate
+
+
+class _Request:
+    """An object an import will create; setup runs once every requested object exists, then props are set."""
+    __slots__ = ('name', 'data', 'setup', 'obj', 'props', 'hidden')
+
+    def __init__(self, name, data, setup):
+        self.name, self.data, self.setup, self.obj = name, data, setup, None
+        self.props, self.hidden = {}, False
+
+
+def _resolve(value):
+    """The object of a request, or the value itself when it is already an object."""
+    return value.obj if isinstance(value, _Request) else value
+
+
+class _Objects:
+    """
+    The objects of one import, created together in name order and then set up in request order.
+    Blender keeps objects sorted by name and finds a new object's place from the end of the list,
+    so an object created out of name order costs time in proportion to every object after it.
+    """
+    STEP = 2000
+
+    def __init__(self):
+        self.names = _Names(bpy.data.objects)
+        self.requests = []
+
+    def add(self, name, data=None, setup=None):
+        request = _Request(self.names(name), data, setup)
+        self.requests.append(request)
+        return request
+
+    def create(self, phase):
+        """Steps that create every requested object; the order matches Blender's case-blind byte order."""
+        order = sorted(self.requests, key=lambda request: request.name.encode('utf-8').lower())
+        for count, request in enumerate(order, 1):
+            request.obj = bpy.data.objects.new(request.name, request.data)
+            if count % self.STEP == 0:
+                yield phase, count, len(order)
+
+    def set_up(self, phase_of):
+        """Steps that run each request's setup in request order; phase_of(request index) names the phase."""
+        for index, request in enumerate(self.requests):
+            if request.setup is not None:
+                request.setup(request.obj)
+            for key, value in request.props.items():
+                request.obj[key] = value
+            if index % self.STEP == 0:
+                yield phase_of(index), index, len(self.requests)
+
+
+class _Layout:
+    """
+    Transforms and hiding for a collection's objects, written in one pass when the collection is done.
+    A single hide write updates every collection, and a single matrix check is slow in Python.
+    """
+    IDENTITY = np.eye(4, dtype=np.float32).reshape(-1)
+
+    def __init__(self, collection):
+        self.collection = collection
+        self.matrices, self.hidden, self.rows = [], [], {}
+
+    def link(self, obj, matrix=None, hidden=False):
+        """
+        matrix is a placement's 16 values in row-vector order, which is Blender's memory order.
+        When any object has one, an object without one gets the identity; otherwise transforms stay as set.
+        """
+        self.collection.objects.link(obj)
+        self.rows[obj.as_pointer()] = len(self.matrices)
+        self.matrices.append(matrix)
+        self.hidden.append(hidden)
+
+    def hide(self, obj, hidden=True):
+        self.hidden[self.rows[obj.as_pointer()]] = hidden
+
+    def is_hidden(self, obj):
+        return self.hidden[self.rows[obj.as_pointer()]]
+
+    def write(self, refresh=False):
+        """A matrix the object cannot hold as location, rotation and scale goes to its parent inverse."""
+        objects = self.collection.objects
+        if len(objects) != len(self.matrices):
+            raise RuntimeError('Collection objects changed during the import.')
+        if any(matrix is not None for matrix in self.matrices):
+            self._transforms(objects)
+        hidden = np.array(self.hidden, dtype=bool)
+        if hidden.any():
+            objects.foreach_set('hide_render', hidden)
+            objects.foreach_set('hide_viewport', hidden)
+            if refresh:
+                # A bulk write skips the view layer update; one ordinary write runs it.
+                first = objects[int(np.argmax(hidden))]
+                first.hide_viewport = True
+
+    def _transforms(self, objects):
+        basis = np.tile(self.IDENTITY, (len(self.matrices), 1))
+        for index, matrix in enumerate(self.matrices):
+            if matrix is not None:
+                basis[index] = matrix
+        objects.foreach_set('matrix_basis', basis.reshape(-1))
+        held = np.empty(basis.size, dtype=np.float32)
+        objects.foreach_get('matrix_basis', held)
+        held = held.reshape(basis.shape).astype(np.float64)
+        moved = ~(np.isfinite(held).all(axis=1) & (np.abs(held - basis) <= 0.00001).all(axis=1))
+        if moved.any():
+            inverse = np.tile(self.IDENTITY, (len(basis), 1))
+            inverse[moved], basis[moved] = basis[moved], self.IDENTITY
+            objects.foreach_set('matrix_parent_inverse', inverse.reshape(-1))
+            objects.foreach_set('matrix_basis', basis.reshape(-1))
 
 
 def _uid(block):
@@ -1454,13 +1603,15 @@ def _build_material_preview(material, profile):
         node['sunrise_preview_roles'] = '[]'
     serial = 0
     math_serial = 0
+    # Each node edit updates the whole tree, so locations are set together before pruning.
+    placed = []
 
     def node(kind, label, x=0, y=0):
         nonlocal serial
         value = tree.nodes.new(kind)
         value.label = label
         value['sunrise_preview_node'] = True
-        value.location = (x, y - serial * 12)
+        placed.append((value, x, y - serial * 12))
         serial += 1
         return value
 
@@ -1470,6 +1621,8 @@ def _build_material_preview(material, profile):
             if socket.is_linked:
                 for link in list(socket.links):
                     tree.links.remove(link)
+            elif _holds(socket, value):
+                return
             socket.default_value = value
         else:
             tree.links.new(value, socket)
@@ -1687,17 +1840,48 @@ def _build_material_preview(material, profile):
     material['sunrise_preview_mode'] = profile.get('Mode', 'Material preview')
     material['sunrise_preview_notes'] = '\n'.join(profile.get('Notes', []))
     material['sunrise_preview_profile'] = json.dumps(profile)
+    _place_nodes(tree, placed)
     _prune_preview(tree, output)
+
+
+def _holds(socket, value):
+    """True when an unlinked socket already holds value; writing it again would update the whole tree."""
+    current = getattr(socket, 'default_value', None)
+    if current is None or isinstance(current, (str, bpy.types.ID)):
+        return False
+    if isinstance(value, (int, float)):
+        return isinstance(current, (int, float)) and np.float32(value) == np.float32(current)
+    try:
+        return len(current) == len(value) and bool((np.asarray(current[:], np.float32) == np.asarray(value, np.float32)).all())
+    except TypeError:
+        return False
+
+
+def _place_nodes(tree, placed):
+    """Sets the locations of new nodes in one write; nodes must not have a frame yet."""
+    wanted = {node.name: (x, y) for node, x, y in placed}
+    if not wanted:
+        return
+    locations = np.empty(len(tree.nodes) * 2, dtype=np.float32)
+    tree.nodes.foreach_get('location', locations)
+    for index, item in enumerate(tree.nodes):
+        if item.name in wanted:
+            locations[index * 2:index * 2 + 2] = wanted[item.name]
+    tree.nodes.foreach_set('location', locations)
 
 
 def _prune_preview(tree, output):
     """Preview nodes that do not reach the output are removed; unwired native fields go in one frame."""
+    # socket.links scans the whole tree, so the sources of each node are read in one pass.
+    sources = {}
+    for link in tree.links:
+        sources.setdefault(link.to_node.name, []).append(link.from_node)
     reached, pending = set(), [output]
     while pending:
         item = pending.pop()
         if item.name not in reached:
             reached.add(item.name)
-            pending.extend(link.from_node for socket in item.inputs for link in socket.links)
+            pending.extend(sources.get(item.name, ()))
     for item in list(tree.nodes):
         if item.name not in reached and item.get('sunrise_preview_node'):
             tree.nodes.remove(item)
@@ -1842,19 +2026,34 @@ def _material_shading():
                 area.spaces.active.shading.type = 'MATERIAL'
 
 
+BUNDLE_PHASES = ('Reading the bundle', 'Textures', 'Materials', 'glTF scene', 'Meshes', 'Effects and collision', 'Finishing')
+# Data the glTF importer and the bundle import can add.
+BUNDLE_KINDS = ('objects', 'collections', 'meshes', 'materials', 'images', 'actions', 'armatures', 'node_groups', 'texts',
+                'cameras', 'lights', 'curves')
+
+
 def import_bundle(manifest_path):
     """Import original geometry identities; glTF supplies the rig and preview actions."""
+    return progress.run(import_bundle_steps(manifest_path))
+
+
+def import_bundle_steps(manifest_path):
+    """The bundle import as steps that yield (phase, done, total); closing them early removes what they added."""
     path = _manifest_path(manifest_path)
+    yield BUNDLE_PHASES[0], 0, 0
     document = _read(path)
     if document.get("Format") != "sunrise-asset-bundle" or document.get("Version") != 1:
         raise ValueError("Unsupported Sunrise asset bundle.")
     if any(c.get("sunrise_manifest") == str(path) for c in bpy.data.collections):
         raise ValueError("This bundle is already imported.")
     root = path.parent
-    previous = set(bpy.data.objects)
-    previous_actions = set(bpy.data.actions)
+    scene = bpy.context.scene
+    before = progress.snapshot(BUNDLE_KINDS)
+    scene_state = (scene.render.fps, scene.render.fps_base, scene.get("sunrise_active_bundle"))
+    previous = before['objects']
+    previous_actions = before['actions']
     collection = bpy.data.collections.new(document["Name"])
-    bpy.context.scene.collection.children.link(collection)
+    scene.collection.children.link(collection)
     collection["sunrise_manifest"] = str(path)
     collection["sunrise_manifest_sha256"] = _sha(path)
     collection["sunrise_external_objects"] = json.dumps([_uid(o) for o in previous])
@@ -1866,24 +2065,28 @@ def import_bundle(manifest_path):
             print("Sunrise material fallback: " + notice["Message"])
         # Build materials before the glTF import; a node rename is slow once actions exist.
         images = {}
-        for texture in document.get("Textures", []):
-            for item in texture["Images"]:
-                if (item["Mip"], item["Slice"], item["DepthSlice"]) != (0, 0, 0):
-                    continue
-                key = (texture["TagHash"], item["Mip"], item["Slice"], item["DepthSlice"])
-                images[key] = _load_image(root, item["Path"], *key, expected=item["Sha256"])
+        items = [(texture, item) for texture in document.get("Textures", []) for item in texture["Images"]
+                 if (item["Mip"], item["Slice"], item["DepthSlice"]) == (0, 0, 0)]
+        for index, (texture, item) in enumerate(items):
+            key = (texture["TagHash"], item["Mip"], item["Slice"], item["DepthSlice"])
+            images[key] = _load_image(root, item["Path"], *key, expected=item["Sha256"])
+            yield 'Textures', index + 1, len(items)
         used = {_material_key(m["TagHash"], m.get("Variant"))
                 for m in (_mesh_material(document, info) for info in document["Meshes"]) if m}
         used |= {str(document["RootTag"]), str(document["SelectedTag"])}
-        materials = {_material_key(info["TagHash"], info.get("Variant")): _material(root, info, images, document)
-                     for info in document.get("Materials", []) if _material_key(info["TagHash"], info.get("Variant")) in used}
+        wanted = [info for info in document.get("Materials", []) if _material_key(info["TagHash"], info.get("Variant")) in used]
+        materials = {}
+        for info in wanted:
+            materials[_material_key(info["TagHash"], info.get("Variant"))] = _material(root, info, images, document)
+            yield 'Materials', len(materials), len(wanted)
         collection["sunrise_loaded_materials"] = json.dumps({key: _uid(value) for key, value in materials.items()})
         scene_document = None
         if document.get("ScenePath"):
             scene_path = _path(root, document["ScenePath"])
             scene_document = _validate_gltf(root, scene_path)
-            bpy.context.scene.render.fps = 30
-            bpy.context.scene.render.fps_base = 1
+            yield 'glTF scene', 0, 0
+            scene.render.fps = 30
+            scene.render.fps_base = 1
             bpy.ops.import_scene.gltf(filepath=str(scene_path), merge_vertices=False, import_pack_images=False,
                                       disable_bone_shape=True)
         imported = list(set(bpy.data.objects) - previous)
@@ -1913,7 +2116,8 @@ def import_bundle(manifest_path):
             raise ValueError("glTF mesh identities differ from the manifest.")
         materialless = 0
         guardian = bool((document.get('Context') or {}).get('Guardian'))
-        for info in document["Meshes"]:
+        for mesh_index, info in enumerate(document["Meshes"]):
+            yield 'Meshes', mesh_index, len(document["Meshes"])
             source = _path(root, info["Path"])
             if _sha(source) != info["Sha256"]:
                 raise ValueError("Original geometry changed on disk.")
@@ -1950,6 +2154,7 @@ def import_bundle(manifest_path):
         _apply_stage_blends(collection, document)
         if materialless:
             print(f'Sunrise bundle: {materialless} mesh parts have no resolved material.')
+        yield 'Effects and collision', 0, 0
         _import_emitters(root, collection, document)
         # Run as a single file, without its package, the bundle draws no baked effects.
         if __package__:
@@ -1976,6 +2181,7 @@ def import_bundle(manifest_path):
                 # The tag stays in the name and a property; pose lookup matches either.
                 action['sunriseClipTag'] = tag
                 action.name = f'{clip_names[tag]} [Pose_{tag}]'
+        yield 'Finishing', 0, 0
         bpy.context.view_layer.update()
         collection["sunrise_objects"] = json.dumps([_uid(o) for o in collection.all_objects])
         collection["sunrise_rigs"] = json.dumps({_uid(o): _rig_state(o) for o in imported if o.type == 'ARMATURE'})
@@ -1986,10 +2192,13 @@ def import_bundle(manifest_path):
         _apply_lod_visibility(collection, document, bpy.context.scene)
         _material_shading()
         return collection
-    except Exception:
-        for obj in set(bpy.data.objects) - previous:
-            bpy.data.objects.remove(obj, do_unlink=True)
-        bpy.data.collections.remove(collection)
+    except BaseException:
+        scene.render.fps, scene.render.fps_base = scene_state[:2]
+        if scene_state[2] is None:
+            scene.pop("sunrise_active_bundle", None)
+        else:
+            scene["sunrise_active_bundle"] = scene_state[2]
+        progress.rollback(before)
         raise
 
 
@@ -2771,12 +2980,13 @@ def _control_edits(root, collection, document, transaction):
     return output
 
 
-class SUNRISE_OT_import_bundle(bpy.types.Operator, ImportHelper):
+class SUNRISE_OT_import_bundle(progress.ImportSteps, bpy.types.Operator, ImportHelper):
     bl_idname = "sunrise.import_bundle"
     bl_label = "Import Sunrise bundle"
     bl_description = "Open asset.sunrise-bundle.json from an exported bundle"
     filename_ext = ".json"
     filter_glob: StringProperty(default="*.json", options={'HIDDEN'}, maxlen=255)
+    phases = BUNDLE_PHASES
 
     def invoke(self, context, event):
         active = context.scene.get("sunrise_active_bundle")
@@ -2785,12 +2995,10 @@ class SUNRISE_OT_import_bundle(bpy.types.Operator, ImportHelper):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
-    def execute(self, context):
-        try:
-            collection = import_bundle(self.filepath)
-        except (ValueError, OSError, RuntimeError, KeyError) as error:
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
+    def steps(self, context):
+        return import_bundle_steps(self.filepath)
+
+    def finished(self, context, collection):
         missing = collection.get('sunrise_materialless_parts', 0)
         if missing:
             self.report({'WARNING'}, f'{missing} mesh parts have no resolved material.')

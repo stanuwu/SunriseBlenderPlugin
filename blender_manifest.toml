@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "sunrise_blender_plugin"
-version = "1.13.19"
+version = "1.13.21"
 name = "Sunrise Studio"
 tagline = "Sunrise Studio Import/Export"
 maintainer = "stanuwu"
