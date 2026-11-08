@@ -8,11 +8,11 @@ bl_info = {"name": "Sunrise Studio", "blender": (5, 2, 0),
 # A submodule that an older copy of this file never imported is imported fresh below.
 if "bundle" in globals():
     import importlib
-    for _name in ("progress", "bundle", "material", "original", "world_lights", "effects", "world", "weapon"):
+    for _name in ("progress", "shader_lift", "bundle", "material", "original", "world_lights", "effects", "world", "weapon"):
         if _name in globals():
             importlib.reload(globals()[_name])
 
-from . import progress, bundle, material, original, world_lights, effects, world, weapon
+from . import progress, shader_lift, bundle, material, original, world_lights, effects, world, weapon
 
 
 def register():

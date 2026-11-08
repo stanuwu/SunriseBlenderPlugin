@@ -20,13 +20,17 @@ from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Vector
 
 if __package__:
-    from . import progress
+    from . import progress, shader_lift
 else:
-    # Run as a single file, the module loads the progress module beside it.
+    # Run as a single file, the module loads the modules beside it.
     import importlib.util
-    _spec = importlib.util.spec_from_file_location('sunrise_progress', Path(__file__).with_name('progress.py'))
-    progress = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(progress)
+
+    def _sibling(name):
+        spec = importlib.util.spec_from_file_location('sunrise_' + name, Path(__file__).with_name(name + '.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    progress, shader_lift = _sibling('progress'), _sibling('shader_lift')
 
 
 MANIFEST = "asset.sunrise-bundle.json"
@@ -400,7 +404,7 @@ def _motion_image(texture):
 def _node_math(group):
     """connect(value, socket) and math_node(operation, *inputs) that build plain math nodes in group."""
     def connect(value, socket):
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float, tuple, list)):
             socket.default_value = value
         else:
             group.links.new(value, socket)
@@ -442,8 +446,8 @@ def _attach_motion(obj, group, name, reorder):
 def _vertex_program_group(motion):
     """The "Offset" of a vertex program as geometry nodes; each stream reads the mesh's own attribute."""
     group, position = _offset_group('Sunrise vertex program')
-    streams, values = {}, {}
-    connect, math_node = _node_math(group)
+    streams = {}
+    connect, _ = _node_math(group)
 
     def stream(operation, channel):
         if operation not in streams:
@@ -456,6 +460,7 @@ def _vertex_program_group(motion):
                 split = group.nodes.new('FunctionNodeSeparateColor')
                 group.links.new(attribute.outputs['Attribute'], split.inputs['Color'])
                 streams[operation] = list(split.outputs)
+                streams[operation + ' vector'] = attribute.outputs['Attribute']
             else:
                 if operation == 'normal':
                     vector = group.nodes.new('GeometryNodeInputNormal').outputs['Normal']
@@ -468,54 +473,106 @@ def _vertex_program_group(motion):
                 split = group.nodes.new('ShaderNodeSeparateXYZ')
                 group.links.new(vector, split.inputs[0])
                 streams[operation] = list(split.outputs)
-        return streams[operation][channel]
+                streams[operation + ' vector'] = vector
+        return streams[operation][channel] if channel is not None else streams[operation + ' vector']
 
     try:
-        _vertex_program_nodes(group, motion, position, connect, math_node, stream, values)
+        _vertex_program_nodes(group, motion, position, connect, stream)
     except ValueError:
         bpy.data.node_groups.remove(group)
         raise
     return group
 
 
-def _vertex_program_nodes(group, motion, position, connect, math_node, stream, values):
-    """The program's nodes in order; an input always precedes its node."""
+def _vertex_program_nodes(group, motion, position, connect, stream):
+    """The program's "Offset" lanes as lifted geometry nodes; an input always precedes its node.
+
+    stream(operation, channel) gives one lane of a mesh stream; channel None gives the whole vector.
+    """
     program, fetches = motion['Program'], {}
-    nodes = program['Nodes']
-    for index, item in enumerate(nodes):
-        operation = item['Operation']
+    for index, item in enumerate(program['Nodes']):
         if any(value < 0 or value >= index for value in item['Inputs']):
             raise ValueError('Vertex program is not an ordered expression graph.')
+    lift = shader_lift.Lift(program)
+
+    def node(kind, label):
+        value = group.nodes.new(kind)
+        value.label = label
+        return value
+
+    def fetch(item):
+        """The image node of one sample key, with its colour split into channels."""
+        key = ('sample', int(item['Slot']), *item['Inputs'])
+        if key not in fetches:
+            texture = (motion.get('Textures') or {}).get(str(item['Slot']))
+            image = _motion_image(texture) if texture else None
+            if image is None:
+                raise ValueError('Vertex program needs vertex texture slot ' + str(item['Slot']))
+            sampled = node('GeometryNodeImageTexture', 'Shader sample t' + str(item['Slot']))
+            sampled.inputs['Image'].default_value = image
+            sampled.extension = 'EXTEND' if texture.get('Clamp') else 'REPEAT'
+            vector = lift.as_vector(item['Inputs'])
+            if vector is not None:
+                connect(nodes.flipped(vector), sampled.inputs['Vector'])
+                column = nodes.depth(vector) + 2
+            else:
+                point = node('ShaderNodeCombineXYZ', 'Shader sample UV')
+                nodes.put(lift.scalar(item['Inputs'][0]), point.inputs['X'])
+                flip = node('ShaderNodeMath', '')
+                flip.operation = 'SUBTRACT'
+                flip.inputs[0].default_value = 1
+                nodes.put(lift.scalar(item['Inputs'][1]), flip.inputs[1])
+                connect(flip.outputs[0], point.inputs['Y'])
+                connect(point.outputs[0], sampled.inputs['Vector'])
+                column = max(nodes.depth(lift.scalar(value)) for value in item['Inputs']) + 3
+                nodes.anchor(flip, column - 2)
+                nodes.anchor(point, column - 1)
+            split = node('FunctionNodeSeparateColor', '')
+            connect(sampled.outputs['Color'], split.inputs['Color'])
+            nodes.anchor(sampled, column)
+            nodes.anchor(split, column + 1)
+            fetches[key] = (sampled, [*list(split.outputs)[:3], sampled.outputs['Alpha']])
+        return fetches[key]
+
+    def leaf(index):
+        item = program['Nodes'][index]
+        operation = item['Operation']
         if operation == 'constant':
-            values[index] = float(item['Value'])
-        elif operation in ('time', 'color', 'normal', 'rawposition', 'uv', 'uvzw'):
-            values[index] = stream(operation, int(item['Channel']))
-        elif operation == 'sample':
-            key = ('sample', int(item['Slot']), *item['Inputs'])
-            if key not in fetches:
-                texture = (motion.get('Textures') or {}).get(str(item['Slot']))
-                image = _motion_image(texture) if texture else None
-                if image is None:
-                    raise ValueError('Vertex program needs vertex texture slot ' + str(item['Slot']))
-                fetch = group.nodes.new('GeometryNodeImageTexture')
-                fetch.inputs['Image'].default_value = image
-                fetch.extension = 'EXTEND' if texture.get('Clamp') else 'REPEAT'
-                point = group.nodes.new('ShaderNodeCombineXYZ')
-                connect(values[item['Inputs'][0]], point.inputs['X'])
-                connect(math_node('SUBTRACT', 1, values[item['Inputs'][1]]), point.inputs['Y'])
-                group.links.new(point.outputs[0], fetch.inputs['Vector'])
-                split = group.nodes.new('FunctionNodeSeparateColor')
-                group.links.new(fetch.outputs['Color'], split.inputs['Color'])
-                fetches[key] = [*list(split.outputs)[:3], fetch.outputs['Alpha']]
-            values[index] = fetches[key][int(item['Channel'])]
-        else:
-            values[index] = _program_math(program, item, [values[value] for value in item['Inputs']], math_node)
-            if values[index] is None:
-                raise ValueError('Unsupported vertex program operation: ' + operation)
-    offset = group.nodes.new('ShaderNodeCombineXYZ')
-    for axis, index in enumerate(program['Outputs']['Offset']):
-        connect(values[index], offset.inputs[axis])
-    group.links.new(offset.outputs[0], position.inputs['Offset'])
+            return float(item['Value'])
+        if operation in ('time', 'color', 'normal', 'rawposition', 'uv', 'uvzw'):
+            return stream(operation, int(item['Channel']))
+        if operation == 'sample':
+            return fetch(item)[1][int(item['Channel'])]
+        raise ValueError('Unsupported vertex program operation: ' + operation)
+
+    def leaf_vector(lanes):
+        item = program['Nodes'][lanes[0]]
+        if item['Operation'] == 'sample':
+            return fetch(item)[0].outputs['Color']
+        return stream(item['Operation'], None)
+
+    nodes = _ProgramNodes(lift, node, connect, leaf, leaf_vector)
+    indices = program['Outputs']['Offset']
+    vector = lift.as_vector(indices)
+    if vector is not None:
+        nodes.put(vector, position.inputs['Offset'])
+    else:
+        offset = node('ShaderNodeCombineXYZ', 'Offset')
+        for axis, index in enumerate(indices):
+            nodes.put(lift.scalar(index), offset.inputs[axis])
+        connect(offset.outputs[0], position.inputs['Offset'])
+        nodes.anchor(offset, 1 + max(nodes.depth(lift.scalar(index)) for index in indices))
+    # Mesh inputs one column left of the program; the group's own nodes around it.
+    for item in group.nodes:
+        if item.bl_idname not in ('NodeGroupInput', 'NodeGroupOutput', 'GeometryNodeSetPosition'):
+            nodes.anchor(item, -1)
+
+    def place(value, x, y):
+        value.location = (x, y)
+    right = nodes.layout(place) or PROGRAM_LEFT
+    for item, x in (('NodeGroupInput', PROGRAM_LEFT - 2 * PROGRAM_COLUMN), ('GeometryNodeSetPosition', right + 100),
+                    ('NodeGroupOutput', right + 100 + PROGRAM_COLUMN)):
+        next(value for value in group.nodes if value.bl_idname == item).location = (x, PROGRAM_TOP)
 
 
 def _native_vertex_motion(obj, motion, reorder=True):
@@ -991,43 +1048,8 @@ def _add_preview_role(texture, role):
     return roles
 
 
-# Program operations that one Blender math node computes.
-PROGRAM_OPERATIONS = {'add': 'ADD', 'mul': 'MULTIPLY', 'div': 'DIVIDE', 'mad': 'MULTIPLY_ADD',
-                      'min': 'MINIMUM', 'max': 'MAXIMUM', 'abs': 'ABSOLUTE', 'sqrt': 'SQRT',
-                      'round_ni': 'FLOOR', 'round_ne': 'ROUND', 'round_pi': 'CEIL', 'round_z': 'TRUNC',
-                      'sin': 'SINE', 'cos': 'COSINE', 'lt': 'LESS_THAN'}
-# Every program operation _program_math builds.
-PROGRAM_MATH = set(PROGRAM_OPERATIONS) | {'neg', 'rsq', 'exp', 'log', 'frc', 'eq', 'ne', 'ge', 'movc'}
-
-
-def _program_math(program, item, inputs, math_node):
-    """One program math operation as math nodes, in a shader or a geometry tree; None for any other operation."""
-    operation = item['Operation']
-    if operation in PROGRAM_OPERATIONS:
-        return math_node(PROGRAM_OPERATIONS[operation], *inputs)
-    if operation == 'neg':
-        return math_node('MULTIPLY', inputs[0], -1)
-    if operation == 'rsq':
-        return math_node('INVERSE_SQRT', inputs[0])
-    if operation == 'exp':
-        return math_node('POWER', 2, inputs[0])
-    if operation == 'log':
-        # Blender's log of zero is 0 but Direct3D's is -inf, so a pow of zero built from log must stay 0.
-        return math_node('MULTIPLY_ADD', math_node('LESS_THAN', inputs[0], 1.1754944e-38), -1e30,
-                         math_node('LOGARITHM', inputs[0], 2))
-    if operation == 'frc':
-        return math_node('FRACT', inputs[0])
-    if operation in ('eq', 'ne'):
-        same = math_node('COMPARE', *inputs, 0)
-        return math_node('SUBTRACT', 1, same) if operation == 'ne' else same
-    if operation == 'ge':
-        return math_node('SUBTRACT', 1, math_node('LESS_THAN', *inputs))
-    if operation == 'movc':
-        # A comparison already reads 0 or 1.
-        condition = inputs[0] if program['Nodes'][item['Inputs'][0]]['Operation'] in ('lt', 'ge', 'eq', 'ne') \
-            else math_node('GREATER_THAN', math_node('ABSOLUTE', inputs[0]), 0)
-        return math_node('MULTIPLY_ADD', condition, math_node('SUBTRACT', inputs[1], inputs[2]), inputs[2])
-    return None
+# Every program math operation the lift builds.
+PROGRAM_MATH = set(shader_lift.SCALAR) | {'neg', 'exp', 'log', 'eq', 'ne', 'ge', 'movc'}
 
 
 def _volume_image(root, volume):
@@ -1046,17 +1068,148 @@ def _volume_image(root, volume):
     return image
 
 
-def _apply_material_program(profile, slots, node, connect, math_node, component, uv, signals, root=None):
-    """Known shader expressions keep texture channels, constants, UVs and cutouts together."""
+# Node editor spacing for program columns: left edge, top and column width; an image node is 240 wide.
+PROGRAM_LEFT, PROGRAM_TOP, PROGRAM_COLUMN = -450, -650, 260
+# The material surface node's default place; the output node and a pushed surface sit SURFACE_GAP apart.
+SURFACE_X, SURFACE_Y, SURFACE_GAP = 520, 180, 300
+# Row height in a program column by node type, from the drawn node size; a gap of 20 follows each.
+PROGRAM_ROWS = {'ShaderNodeTexImage': 280, 'ShaderNodeMix': 210, 'ShaderNodeVectorMath': 180, 'ShaderNodeValue': 90,
+                'ShaderNodeSeparateColor': 130, 'ShaderNodeSeparateXYZ': 130, 'ShaderNodeCombineXYZ': 130,
+                'GeometryNodeImageTexture': 170, 'FunctionNodeSeparateColor': 130}
+
+
+class _ProgramNodes:
+    """Builds a lifted program's ops as nodes of one tree, shader or geometry, and lays them out in columns.
+
+    node(kind, label) makes a node; leaf(index) and leaf_vector(lanes) give the sockets of program inputs.
+    """
+
+    def __init__(self, lift, node, connect, leaf, leaf_vector):
+        self.lift, self.node, self.connect, self.leaf, self.leaf_vector = lift, node, connect, leaf, leaf_vector
+        self.built, self.created, self.columns = {}, [], {}
+
+    def anchor(self, value, column):
+        """Adds a node to the column layout once; a node keeps its first column."""
+        if value.name not in self.columns:
+            self.columns[value.name] = column
+            self.created.append((value, column))
+
+    def depth(self, ref):
+        """Column of a ref: an input at its node's column, an op one past its deepest input."""
+        if ref[0] == 'lane':
+            return self.built[('split', ref[1])][1]
+        return self.built[ref][1] if ref in self.built else 0
+
+    def put(self, ref, socket):
+        value = self.build(ref)
+        if isinstance(value, (int, float)) and socket.type in ('VECTOR', 'RGBA'):
+            value = (value,) * (4 if socket.type == 'RGBA' else 3)
+        self.connect(value, socket)
+
+    def flipped(self, vector):
+        """A UV vector with V reversed for Blender's image space; one node per vector."""
+        key = ('flip', vector)
+        if key not in self.built:
+            flip = self.node('ShaderNodeVectorMath', 'Texture V orientation')
+            flip.operation = 'MULTIPLY_ADD'
+            self.put(vector, flip.inputs[0])
+            flip.inputs[1].default_value = (1, -1, 1)
+            flip.inputs[2].default_value = (0, 1, 0)
+            self.built[key] = (flip.outputs['Vector'], self.depth(vector) + 1)
+            self.anchor(flip, self.built[key][1])
+        return self.built[key][0]
+
+    def build(self, ref):
+        """A lifted ref as a socket or a value; each op becomes one node the first time it is read."""
+        kind, built = ref[0], self.built
+        if kind in ('k', 'kv'):
+            return ref[1]
+        if kind in ('leaf', 'vleaf'):
+            if ref not in built:
+                value = self.leaf(ref[1]) if kind == 'leaf' else self.leaf_vector(ref[1])
+                if hasattr(value, 'node'):
+                    self.anchor(value.node, 0)
+                built[ref] = (value, self.columns.get(value.node.name, 0) if hasattr(value, 'node') else 0)
+            return built[ref][0]
+        if kind == 'lane':
+            key = ('split', ref[1])
+            if key not in built:
+                split = self.node('ShaderNodeSeparateXYZ', '')
+                self.put(ref[1], split.inputs[0])
+                built[key] = (split, self.depth(ref[1]) + 1)
+                self.anchor(split, built[key][1])
+            return built[key][0].outputs[ref[2]]
+        if ref in built:
+            return built[ref][0]
+        op = self.lift.ops[ref[1]]
+        if op.kind == 'math':
+            value = self.node('ShaderNodeMath', op.label)
+            value.operation, value.use_clamp = op.operation, op.clamp
+            sockets, output = list(value.inputs)[:len(op.inputs)], value.outputs[0]
+        elif op.kind == 'vector':
+            value = self.node('ShaderNodeVectorMath', op.label)
+            value.operation = op.operation
+            sockets = [value.inputs['Scale'] if op.operation == 'SCALE' and index == 1 else value.inputs[index]
+                       for index in range(len(op.inputs))]
+            output = value.outputs['Value' if op.operation in ('DOT_PRODUCT', 'LENGTH') else 'Vector']
+        elif op.kind == 'mix':
+            value = self.node('ShaderNodeMix', op.label)
+            value.data_type, value.clamp_factor, value.clamp_result = op.operation, False, op.clamp
+            uniform = not shader_lift.is_vector(op.inputs[0], self.lift.ops)
+            if not uniform:
+                value.factor_mode = 'NON_UNIFORM'
+            named = {socket.identifier: socket for socket in value.inputs}
+            suffix = {'FLOAT': 'Float', 'VECTOR': 'Vector', 'RGBA': 'Color'}[op.operation]
+            sockets = [named['Factor_Float' if uniform else 'Factor_Vector'], named['A_' + suffix], named['B_' + suffix]]
+            output = next(socket for socket in value.outputs if socket.identifier == 'Result_' + suffix)
+        elif op.kind == 'clamp':
+            value = self.node('ShaderNodeClamp', op.label)
+            sockets, output = list(value.inputs)[:3], value.outputs[0]
+        else:
+            value = self.node('ShaderNodeCombineXYZ', '')
+            sockets, output = list(value.inputs)[:3], value.outputs[0]
+        for source, socket in zip(op.inputs, sockets):
+            self.put(source, socket)
+        built[ref] = (output, 1 + max((self.depth(source) for source in op.inputs), default=0))
+        self.anchor(value, built[ref][1])
+        return output
+
+    def layout(self, place):
+        """Columns run left to right from the inputs, in build order. Returns the right edge, or None."""
+        used = {}
+        for value, column in self.created:
+            place(value, PROGRAM_LEFT + column * PROGRAM_COLUMN, PROGRAM_TOP - used.get(column, 0))
+            used[column] = used.get(column, 0) + PROGRAM_ROWS.get(value.bl_idname, 160) + 20
+        return PROGRAM_LEFT + max(used) * PROGRAM_COLUMN if used else None
+
+
+def _apply_material_program(profile, slots, node, connect, math_node, component, uv, signals, root=None,
+                            constants=None, place=None):
+    """Known shader expressions keep texture channels, constants, UVs and cutouts together.
+
+    constants maps a template cb0 lane, row * 4 + lane, to its native field node; the program reads that node.
+    place(node, x, y) moves a node. Returns the right edge of the program's columns, or None.
+    """
     program = profile.get('Program')
     if not program:
-        return
+        return None
     # A dye recipe or palette owns the surface; the program then adds only its cutout. Any other program is the surface.
     owned = str(profile.get('Recipe') or '').startswith('VexDye') or profile.get('Palette')
     roles = [role for role in program['Outputs'] if not owned or role == 'Visibility']
     if not roles:
-        return
-    values, samples, basis_values = {}, {}, {}
+        return None
+    constants = constants or {}
+    samples, basis_values, basis_vectors = {}, {}, {}
+    # Every node this builds is recorded, so input helpers can join the column layout.
+    made, make_node, make_math = [], node, math_node
+
+    def node(kind, label, *location):
+        made.append(make_node(kind, label, *location))
+        return made[-1]
+
+    def math_node(operation, *values):
+        made.append(make_math(operation, *values).node)
+        return made[-1].outputs[0]
     basis_available = basis_reflected = None
     separate = node('ShaderNodeSeparateXYZ', 'Shader UV components')
     connect(uv, separate.inputs[0])
@@ -1076,6 +1229,7 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             split = node('ShaderNodeSeparateXYZ', 'Shader UV map 1 components')
             connect(source.outputs['UV'], split.inputs[0])
             shared['detail'] = split.outputs
+            shared['detail vector'] = source.outputs['UV']
         return shared['detail']
 
     def vertex_stream(name):
@@ -1086,6 +1240,7 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             split = node('ShaderNodeSeparateXYZ', 'Shader vertex ' + name + ' components')
             connect(attribute.outputs['Color' if name == 'color' else 'Vector'], split.inputs[0])
             shared[name] = [*split.outputs, attribute.outputs['Alpha']]
+            shared[name + ' vector'] = attribute.outputs['Color' if name == 'color' else 'Vector']
         return shared[name]
 
     def instance_inputs(channel):
@@ -1138,13 +1293,14 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             view = node('ShaderNodeVectorTransform', 'Shader view axis')
             view.vector_type, view.convert_from, view.convert_to = 'VECTOR', 'CAMERA', 'WORLD'
             view.inputs['Vector'].default_value = (0, 0, 1)
-            shared['vectors'] = {}
+            shared['vectors'], shared['world vectors'] = {}, {}
             for name, socket in (('position', geometry.outputs['Position']), ('camera', eye),
                                  ('normal', geometry.outputs['Normal']), ('tangent', tangent.outputs['Tangent']),
                                  ('bitangent', bitangent), ('view', view.outputs['Vector'])):
                 split = node('ShaderNodeSeparateXYZ', 'Shader world ' + name)
                 connect(socket, split.inputs[0])
                 shared['vectors'][name] = split.outputs
+                shared['world vectors'][name] = socket
         return shared['vectors']
 
     def object_normal():
@@ -1154,6 +1310,7 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             split = node('ShaderNodeSeparateXYZ', 'Shader object normal components')
             connect(coordinates.outputs['Normal'], split.inputs[0])
             shared['normal'] = split.outputs
+            shared['normal vector'] = coordinates.outputs['Normal']
         return shared['normal']
 
     def world_basis():
@@ -1187,6 +1344,7 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             separate_basis = node('ShaderNodeSeparateXYZ', 'Shader world basis ' + str(index))
             connect(guarded.outputs['Vector'], separate_basis.inputs[0])
             basis_values[index] = separate_basis.outputs
+            basis_vectors[index] = guarded.outputs['Vector']
         reflected = node('ShaderNodeAttribute', 'Shader instance reflected')
         reflected.attribute_name = 'sunrise_shader_reflected'
         basis_reflected = math_node('GREATER_THAN', reflected.outputs['Fac'], .5)
@@ -1252,66 +1410,36 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             channels[channel] = lerp(planes[0], planes[1], weights[2])
         return channels[channel]
 
-    def expression(index):
-        if index in values:
-            return values[index]
-        item = program['Nodes'][index]
-        operation = item['Operation']
-        negated = [i for i in item['Inputs'] if program['Nodes'][i]['Operation'] == 'neg']
-        if operation == 'add' and negated:
-            # a + -b is one subtraction; the negation is built only where another node reads it.
-            kept = item['Inputs'][0] if negated[-1] == item['Inputs'][1] else item['Inputs'][1]
-            values[index] = math_node('SUBTRACT', expression(kept), expression(program['Nodes'][negated[-1]]['Inputs'][0]))
-            return values[index]
-        inputs = [expression(i) for i in item['Inputs']]
-        if operation == 'constant':
-            result = item['Value']
-        elif operation == 'uv':
-            result = separate.outputs[item['Channel']] if item['Channel'] < 2 else detail_uv()[item['Channel'] - 2]
-        elif operation == 'screen':
-            result = screen()[item['Channel']]
-        elif operation in ('color', 'uvzw', 'rawposition'):
-            result = vertex_stream(operation)[item['Channel']]
-        elif operation == 'instance':
-            result = instance_inputs(item['Channel'])
-        elif operation == 'time':
-            result = scene_time()
-        elif operation == 'normal':
-            result = object_normal()[item['Channel']]
-        elif operation in ('position', 'camera', 'view'):
-            result = world_vectors()[operation][item['Channel']]
-        elif operation == 'surface':
-            result = world_vectors()[('normal', 'tangent', 'bitangent')[int(item['Slot'])]][item['Channel']]
-        elif operation == 'basis':
-            world_basis()
-            result = basis_values[int(item['Slot'])][item['Channel']]
-        elif operation == 'frontface':
-            world_basis()
-            geometry = node('ShaderNodeNewGeometry', 'Shader facing')
-            # Blender corrects Backfacing for reflected objects; native raster facing keeps the winding.
-            result = math_node('ABSOLUTE', math_node('SUBTRACT',
-                               math_node('SUBTRACT', 1, geometry.outputs['Backfacing']), basis_reflected))
-        elif operation == 'sample':
-            slot = int(item['Slot'])
-            sampler_slot = item.get('SamplerSlot')
-            key = (slot, sampler_slot, *item['Inputs'])
-            if key not in samples:
-                original = slots.get(slot)
-                if original is None or original.image is None:
-                    raise ValueError('Shader expression needs native texture slot ' + str(slot))
-                texture = node('ShaderNodeTexImage', 'Shader sample t' + str(slot))
-                formats = profile.get('TextureFormats') or {}
-                fmt = formats.get(str(slot), formats.get(slot))
-                srgb = int(fmt) in SRGB_FORMATS if fmt is not None else any(
-                    b.get('Srgb') for b in profile.get('Bindings', []) if int(b['Slot']) == slot)
-                texture.image = _preview_image(original.image, srgb)
-                samplers = profile.get('Samplers') or {}
-                sampler = samplers.get(str(sampler_slot), samplers.get(sampler_slot)) or {}
-                if sampler.get('AddressU') == sampler.get('AddressV') == 'Clamp':
-                    texture.extension = 'EXTEND'
-                elif sampler.get('AddressU') == sampler.get('AddressV') == 'Wrap':
-                    texture.extension = 'REPEAT'
-                if sampler.get('Filter') == 'MinMagMipPoint':
+    lift = shader_lift.Lift(program)
+    def texture(item):
+        """The image node of one sample key; its coordinates flip V as Blender's image space needs."""
+        slot = int(item['Slot'])
+        sampler_slot = item.get('SamplerSlot')
+        key = (slot, sampler_slot, *item['Inputs'])
+        if key not in samples:
+            original = slots.get(slot)
+            if original is None or original.image is None:
+                raise ValueError('Shader expression needs native texture slot ' + str(slot))
+            texture = node('ShaderNodeTexImage', 'Shader sample t' + str(slot))
+            formats = profile.get('TextureFormats') or {}
+            fmt = formats.get(str(slot), formats.get(slot))
+            srgb = int(fmt) in SRGB_FORMATS if fmt is not None else any(
+                b.get('Srgb') for b in profile.get('Bindings', []) if int(b['Slot']) == slot)
+            texture.image = _preview_image(original.image, srgb)
+            samplers = profile.get('Samplers') or {}
+            sampler = samplers.get(str(sampler_slot), samplers.get(sampler_slot)) or {}
+            if sampler.get('AddressU') == sampler.get('AddressV') == 'Clamp':
+                texture.extension = 'EXTEND'
+            elif sampler.get('AddressU') == sampler.get('AddressV') == 'Wrap':
+                texture.extension = 'REPEAT'
+            point = sampler.get('Filter') == 'MinMagMipPoint'
+            vector = None if point else lift.as_vector(item['Inputs'])
+            if vector is not None:
+                connect(program_nodes.flipped(vector), texture.inputs['Vector'])
+                anchor(texture, depth(vector) + 2)
+            else:
+                inputs = [build(lift.scalar(value)) for value in item['Inputs']]
+                if point:
                     texture.interpolation = 'Closest'
                     # Snap before V reversal so both APIs select the same boundary texel.
                     inputs = [math_node('DIVIDE', math_node('ADD',
@@ -1321,20 +1449,86 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
                 connect(inputs[0], coordinates.inputs['X'])
                 connect(math_node('SUBTRACT', 1, inputs[1]), coordinates.inputs['Y'])
                 connect(coordinates.outputs[0], texture.inputs['Vector'])
-                samples[key] = texture
-            result = component(samples[key], 'rgba'[item['Channel']])
-        elif operation == 'volume':
-            result = volume(item, inputs)
-        else:
-            result = _program_math(program, item, inputs, math_node)
-            if result is None:
-                raise ValueError('Unsupported shader expression: ' + operation)
-        values[index] = result
-        return result
+                column = max(depth(lift.scalar(value)) for value in item['Inputs']) + 2
+                anchor(coordinates, column)
+                anchor(texture, column + 1)
+            samples[key] = texture
+        return samples[key]
+
+    def leaf(index):
+        """One input lane the program reads: a stream, a texture channel, a native constant or a world value."""
+        item = program['Nodes'][index]
+        operation = item['Operation']
+        if operation == 'constant':
+            native = constants.get(item.get('TemplateLane'))
+            return native.outputs[0] if native is not None else item['Value']
+        if operation == 'uv':
+            return separate.outputs[item['Channel']] if item['Channel'] < 2 else detail_uv()[item['Channel'] - 2]
+        if operation == 'screen':
+            return screen()[item['Channel']]
+        if operation in ('color', 'uvzw', 'rawposition'):
+            return vertex_stream(operation)[item['Channel']]
+        if operation == 'instance':
+            return instance_inputs(item['Channel'])
+        if operation == 'time':
+            return scene_time()
+        if operation == 'normal':
+            return object_normal()[item['Channel']]
+        if operation in ('position', 'camera', 'view'):
+            return world_vectors()[operation][item['Channel']]
+        if operation == 'surface':
+            return world_vectors()[('normal', 'tangent', 'bitangent')[int(item['Slot'])]][item['Channel']]
+        if operation == 'basis':
+            world_basis()
+            return basis_values[int(item['Slot'])][item['Channel']]
+        if operation == 'frontface':
+            world_basis()
+            geometry = node('ShaderNodeNewGeometry', 'Shader facing')
+            # Blender corrects Backfacing for reflected objects; native raster facing keeps the winding.
+            return math_node('ABSOLUTE', math_node('SUBTRACT',
+                             math_node('SUBTRACT', 1, geometry.outputs['Backfacing']), basis_reflected))
+        if operation == 'sample':
+            image = texture(item)
+            value = component(image, 'rgba'[item['Channel']])
+            if value.node != image:
+                anchor(value.node, columns[image.name] + 1)
+            return value
+        if operation == 'volume':
+            return volume(item, [build(lift.scalar(value)) for value in item['Inputs']])
+        raise ValueError('Unsupported shader expression: ' + operation)
+
+    def leaf_vector(lanes):
+        """The socket that holds a leaf group's lanes; lanes past the group's width are unused."""
+        item = program['Nodes'][lanes[0]]
+        operation = item['Operation']
+        if operation == 'sample':
+            return texture(item).outputs['Color']
+        if operation == 'uv':
+            if item['Channel'] < 2:
+                return uv
+            detail_uv()
+            return shared['detail vector']
+        if operation in ('color', 'uvzw', 'rawposition'):
+            vertex_stream(operation)
+            return shared[operation + ' vector']
+        if operation == 'normal':
+            object_normal()
+            return shared['normal vector']
+        if operation in ('position', 'camera', 'view', 'surface'):
+            world_vectors()
+            name = ('normal', 'tangent', 'bitangent')[int(item['Slot'])] if operation == 'surface' else operation
+            return shared['world vectors'][name]
+        if operation == 'basis':
+            world_basis()
+            return basis_vectors[int(item['Slot'])]
+        raise ValueError('Unsupported shader vector: ' + operation)
+
+    program_nodes = _ProgramNodes(lift, node, connect, leaf, leaf_vector)
+    build, put, depth, anchor = program_nodes.build, program_nodes.put, program_nodes.depth, program_nodes.anchor
+    columns = program_nodes.columns
 
     available = {}
-    known = PROGRAM_MATH | {'constant', 'uv', 'screen', 'time', 'position', 'camera', 'view', 'surface', 'basis', 'frontface',
-                            'sample', 'color', 'uvzw', 'instance', 'normal', 'rawposition', 'volume'}
+    known = PROGRAM_MATH | shader_lift.LEAVES
     unknown = set()
 
     def can_read(index):
@@ -1367,18 +1561,26 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             if unknown:
                 print(f'Sunrise material preview: {role} needs a newer add-on for {", ".join(sorted(unknown))}.')
             continue
+        vector = lift.as_vector(indices) if len(indices) == 3 else None
         if role in ('BaseColor', 'Emission'):
+            if vector is not None:
+                signals[role] = build(vector)
+                continue
             color = node('ShaderNodeCombineColor', 'Authored base color' if role == 'BaseColor' else 'Authored emission')
             for name, index in zip(('Red', 'Green', 'Blue'), indices):
-                connect(expression(index), color.inputs[name])
+                put(lift.scalar(index), color.inputs[name])
             signals[role] = color.outputs['Color']
         elif role == 'Normal':
-            normal = node('ShaderNodeCombineXYZ', 'Authored world normal')
-            for lane, index in enumerate(indices):
-                connect(expression(index), normal.inputs[lane])
+            if vector is not None:
+                normal = build(vector)
+            else:
+                combined = node('ShaderNodeCombineXYZ', 'Authored world normal')
+                for lane, index in enumerate(indices):
+                    put(lift.scalar(index), combined.inputs[lane])
+                normal = combined.outputs['Vector']
             if not reads(indices, ('basis', 'frontface')):
                 # Built on NORMAL0 alone, it needs no native basis attributes.
-                signals[role] = normal.outputs['Vector']
+                signals[role] = normal
                 continue
             world_basis()
             fallback = signals.get('Normal')
@@ -1387,10 +1589,14 @@ def _apply_material_program(profile, slots, node, connect, math_node, component,
             choose = node('ShaderNodeMixRGB', 'Use shader normal when basis is available')
             connect(basis_available, choose.inputs[0])
             connect(fallback, choose.inputs[1])
-            connect(normal.outputs['Vector'], choose.inputs[2])
+            connect(normal, choose.inputs[2])
             signals[role] = choose.outputs['Color']
         else:
-            signals[role] = expression(indices[0])
+            signals[role] = build(lift.scalar(indices[0]))
+    # Helpers behind the inputs, such as geometry and tangent nodes, go one column left of them.
+    for value in made:
+        anchor(value, -1)
+    return program_nodes.layout(place)
 
 
 def _apply_material_recipe(profile, slots, node, connect, math_node, component, uv, signals, native_normal):
@@ -1601,6 +1807,7 @@ def _build_material_preview(material, profile):
                 slots[int(item['sunrise_preview_slot'])] = item
     for node in slots.values():
         node['sunrise_preview_roles'] = '[]'
+    constants = {int(item['sunrise_preview_constant']): item for item in tree.nodes if 'sunrise_preview_constant' in item}
     serial = 0
     math_serial = 0
     # Each node edit updates the whole tree, so locations are set together before pruning.
@@ -1614,6 +1821,10 @@ def _build_material_preview(material, profile):
         placed.append((value, x, y - serial * 12))
         serial += 1
         return value
+
+    def place(value, x, y):
+        # The last placement of a node wins.
+        placed.append((value, x, y))
 
     def connect(value, socket):
         if isinstance(value, (int, float, tuple, list)):
@@ -1646,9 +1857,9 @@ def _build_material_preview(material, profile):
     connect(uv.outputs['UV'], mapping.inputs[0])
     mapping.inputs[1].default_value = (1, -1, 1)
     mapping.inputs[2].default_value = (0, 1, 0)
-    output = node('ShaderNodeOutputMaterial', 'Material Output', 820, 180)
+    output = node('ShaderNodeOutputMaterial', 'Material Output', SURFACE_X + SURFACE_GAP, SURFACE_Y)
     output.is_active_output = True
-    surface = node('ShaderNodeBsdfPrincipled', 'Material surface', 520, 180)
+    surface = node('ShaderNodeBsdfPrincipled', 'Material surface', SURFACE_X, SURFACE_Y)
     surface.inputs['Base Color'].default_value = profile.get('BaseColor', [1, 1, 1, 1])
     surface.inputs['Metallic'].default_value = profile.get('Metallic', 0)
     surface.inputs['Roughness'].default_value = profile.get('Roughness', .5)
@@ -1788,8 +1999,13 @@ def _build_material_preview(material, profile):
             factor = math_node('MINIMUM', math_node('MAXIMUM',
                                math_node('MULTIPLY_ADD', component(mask, 'g'), blend[1], blend[0]), 0), 1)
             signals['BaseColor'] = color_math('MIX', mixed, colors[6], factor)
-    _apply_material_program(profile, slots, node, connect, math_node, component, uv.outputs['UV'], signals,
-                            material.get('sunrise_preview_root') or material.get('sunrise_bundle_root'))
+    right = _apply_material_program(profile, slots, node, connect, math_node, component, uv.outputs['UV'], signals,
+                                    material.get('sunrise_preview_root') or material.get('sunrise_bundle_root'),
+                                    constants, place)
+    # A program that reaches past the surface pushes the surface and output to its right.
+    if right is not None and right + SURFACE_GAP > SURFACE_X:
+        place(surface, right + SURFACE_GAP, SURFACE_Y)
+        place(output, right + 2 * SURFACE_GAP, SURFACE_Y)
     _apply_material_recipe(profile, slots, node, connect, math_node, component, uv.outputs['UV'], signals, native_normal)
     if 'Visibility' in signals:
         # The native discard is a cutout; alpha carries it with the dithered render method.
@@ -1939,6 +2155,9 @@ def _material(root, info, images, bundle=None):
         node.name = f'Native {field["Offset"]:X}'
         node.label = f'{field["Stage"]} {field["Bank"]} {field["Vector"]}.{field["Component"]}'
         node["sunrise_constant_offset"] = field["Offset"]
+        # A program constant copied from this template lane reads this node, so an edit shows in the preview.
+        if field["Stage"] == "Pixel" and field["Bank"] == "Constant template":
+            node["sunrise_preview_constant"] = field["Vector"] * 4 + "XYZW".index(field["Component"].upper())
         node.outputs[0].default_value = float(field["Value"])
         node.location = (-2050 + index % 4 * 180, -350 - index // 4 * 120)
     profile = info.get('Preview') or _legacy_material_preview(root, info, document, bundle or {})
